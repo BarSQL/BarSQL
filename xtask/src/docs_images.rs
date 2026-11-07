@@ -1,13 +1,12 @@
-// Landing page images from the README screenshots; the icons command writes the app icon's copies. The page picks
-// a scaled copy to fit the screen; the lightbox opens a lossless WebP at the screenshot's native size.
+// The README's and landing page's images, from docs/screenshots. The icons command writes the app icon's copies.
 use std::fs::{self, File};
 use std::io::BufWriter;
 use std::path::{Path, PathBuf};
 
 use image::codecs::jpeg::JpegEncoder;
 use image::codecs::webp::WebPEncoder;
-use image::imageops;
-use image::{ExtendedColorType, RgbImage};
+use image::imageops::{self, FilterType};
+use image::{DynamicImage, ExtendedColorType, RgbImage};
 
 use crate::report;
 
@@ -16,30 +15,39 @@ const WIDTHS: [u32; 3] = [640, 800, 1280];
 // Link preview, cropped from the top of the first screenshot.
 const PREVIEW: (u32, u32) = (1200, 630);
 
-pub fn run(root: &Path) -> Result<(), String> {
-    let (from, docs) = (root.join(".github/screenshots"), root.join("docs"));
-    let to = docs.join("screenshots");
+// The app's PNGs in `shots` replace the kept screenshots, losslessly.
+pub fn keep(shots: &Path, root: &Path) -> Result<(), String> {
+    let to = root.join("docs/screenshots");
     if to.exists() {
         fs::remove_dir_all(&to).map_err(|e| format!("{}: {e}", to.display()))?;
     }
     fs::create_dir_all(&to).map_err(|e| format!("{}: {e}", to.display()))?;
-    let mut shots: Vec<PathBuf> = fs::read_dir(&from)
-        .map_err(|e| format!("{}: {e}", from.display()))?
-        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-        .filter(|path| path.extension().is_some_and(|ext| ext == "png"))
+    for path in files(shots, "png")? {
+        let shot = image::open(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let name = path.file_stem().and_then(|stem| stem.to_str()).unwrap_or_default();
+        let kept = to.join(format!("{name}.webp"));
+        write_webp(&kept, &shot.to_rgb8())?;
+        report(&kept);
+    }
+    Ok(())
+}
+
+pub fn run(root: &Path) -> Result<(), String> {
+    let docs = root.join("docs");
+    let dir = docs.join("screenshots");
+    // Not the copies written beside them.
+    let shots: Vec<PathBuf> = files(&dir, "webp")?
+        .into_iter()
+        .filter(|path| path.file_stem().and_then(|stem| stem.to_str()).is_some_and(|stem| !stem.contains('-')))
         .collect();
     if shots.is_empty() {
-        return Err(format!("no screenshots in {}", from.display()));
+        return Err(format!("no screenshots in {}", dir.display()));
     }
-    shots.sort();
     for path in &shots {
-        let shot = image::open(path).map_err(|e| format!("{}: {e}", path.display()))?.into_rgb8();
+        let shot = image::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
         let name = path.file_stem().and_then(|stem| stem.to_str()).unwrap_or_default();
-        let original = to.join(format!("{name}.webp"));
-        write_webp(&original, &shot)?;
-        report(&original);
         for width in WIDTHS {
-            let scaled = to.join(format!("{name}-{width}.webp"));
+            let scaled = dir.join(format!("{name}-{width}.webp"));
             write_webp(&scaled, &scale(&shot, width))?;
             report(&scaled);
         }
@@ -56,16 +64,26 @@ pub fn run(root: &Path) -> Result<(), String> {
     Ok(())
 }
 
+fn files(dir: &Path, extension: &str) -> Result<Vec<PathBuf>, String> {
+    let mut files: Vec<PathBuf> = fs::read_dir(dir)
+        .map_err(|e| format!("{}: {e}", dir.display()))?
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| path.extension().is_some_and(|ext| ext == extension))
+        .collect();
+    files.sort();
+    Ok(files)
+}
+
 fn write_webp(path: &Path, image: &RgbImage) -> Result<(), String> {
     WebPEncoder::new_lossless(create(path)?)
         .encode(image.as_raw(), image.width(), image.height(), ExtendedColorType::Rgb8)
         .map_err(|e| format!("{}: {e}", path.display()))
 }
 
-// Averages whole pixel areas, which is fast and sharp enough at the sizes used here.
-fn scale(image: &RgbImage, width: u32) -> RgbImage {
+// Catmull-Rom, which the image crate widens by the scale, so every source pixel counts.
+fn scale(image: &DynamicImage, width: u32) -> RgbImage {
     let height = (u64::from(image.height()) * u64::from(width) / u64::from(image.width())) as u32;
-    imageops::thumbnail(image, width, height)
+    image.resize_exact(width, height, FilterType::CatmullRom).into_rgb8()
 }
 
 fn create(path: &Path) -> Result<BufWriter<File>, String> {
