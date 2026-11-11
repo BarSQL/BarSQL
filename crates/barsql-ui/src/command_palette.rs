@@ -1,4 +1,5 @@
 use std::ops::Range;
+use std::rc::Rc;
 
 use gpui_kit::component::input::{Enter, GoToDefinition, InputEvent, InputState, MoveDown, MoveUp};
 use gpui_kit::component::scroll::ScrollbarAxis;
@@ -19,6 +20,8 @@ pub struct Command {
     pub action: Box<dyn Action>,
     // As the keymap has it where the palette was opened.
     pub shortcut: Option<String>,
+    // A word the row also answers to, shown where a shortcut would be.
+    pub tag: Option<String>,
 }
 
 // The menus' actions and the editor's, in menu order, labelled as the menus and the shortcuts list label them.
@@ -61,6 +64,9 @@ fn catalog(cx: &App) -> Vec<(String, Box<dyn Action>)> {
         (theme("theme.dark"), Box::new(ThemeDark)),
         (theme("theme.light"), Box::new(ThemeLight)),
         (theme("theme.system"), Box::new(ThemeSystem)),
+        (theme("theme.select"), Box::new(SelectTheme)),
+        (theme("theme.customize"), Box::new(CustomizeTheme)),
+        (theme("theme.openFolder"), Box::new(OpenThemesFolder)),
         (language("language.en"), Box::new(LanguageEn)),
         (language("language.de"), Box::new(LanguageDe)),
         (language("language.bg"), Box::new(LanguageBg)),
@@ -80,7 +86,7 @@ pub fn commands(focus: &FocusHandle, window: &Window, cx: &App) -> Vec<Command> 
             let shortcut = window
                 .highest_precedence_binding_for_action_in(action.as_ref(), focus)
                 .map(|binding| binding.keystrokes().iter().map(keystroke_label).collect::<Vec<_>>().join(" "));
-            Command { label, action, shortcut }
+            Command { label, action, shortcut, tag: None }
         })
         .collect()
 }
@@ -91,7 +97,10 @@ pub fn rank(query: &str, commands: &[Command]) -> Vec<(usize, Vec<Range<usize>>)
     let mut matches: Vec<(usize, f64, Vec<Range<usize>>)> = commands
         .iter()
         .enumerate()
-        .filter_map(|(ix, command)| rank_candidate(&query, &command.label, &[]).map(|m| (ix, m.score, m.ranges)))
+        .filter_map(|(ix, command)| {
+            let tag = command.tag.as_deref().unwrap_or_default();
+            rank_candidate(&query, &command.label, &[tag]).map(|m| (ix, m.score, m.ranges))
+        })
         .collect();
     // Stable, so equal scores keep menu order.
     matches.sort_by(|a, b| b.1.total_cmp(&a.1));
@@ -104,32 +113,55 @@ fn byte_ranges(text: &str, ranges: &[Range<usize>]) -> Vec<Range<usize>> {
     ranges.iter().filter_map(|range| Some(*offsets.get(range.start)?..*offsets.get(range.end)?)).collect()
 }
 
+type OnCursor = Rc<dyn Fn(&Command, &mut Window, &mut App)>;
+type OnDismiss = Rc<dyn Fn(&mut Window, &mut App)>;
+
+// For a palette that previews its rows, like Select theme…
+#[derive(Clone, Default)]
+pub struct Hooks {
+    pub on_cursor: Option<OnCursor>,
+    pub on_dismiss: Option<OnDismiss>,
+}
+
 pub struct CommandPalette {
     input: Entity<InputState>,
     commands: Vec<Command>,
     items: Vec<(usize, Vec<Range<usize>>)>,
     active: usize,
+    // The row the list opened on, where an emptied query goes back to.
+    home: usize,
     scroll: ScrollHandle,
+    hooks: Hooks,
     _subscription: Subscription,
 }
 
 impl CommandPalette {
-    fn new(commands: Vec<Command>, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let input = cx.new(|cx| InputState::new(window, cx).placeholder(t(cx, "commandPalette.placeholder")));
-        let subscription = cx.subscribe(&input, |this, input, event: &InputEvent, cx| {
+    fn new(
+        commands: Vec<Command>,
+        active: usize,
+        placeholder: SharedString,
+        hooks: Hooks,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let input = cx.new(|cx| InputState::new(window, cx).placeholder(placeholder));
+        let subscription = cx.subscribe_in(&input, window, |this, input, event: &InputEvent, window, cx| {
             if matches!(event, InputEvent::Change) {
                 let query = input.read(cx).value().to_string();
-                this.set_query(&query, cx);
+                this.set_query(&query, window, cx);
             }
         });
         let items = rank("", &commands);
-        Self { input, commands, items, active: 0, scroll: ScrollHandle::new(), _subscription: subscription }
+        let scroll = ScrollHandle::new();
+        scroll.scroll_to_item(active);
+        Self { input, commands, items, active, home: active, scroll, hooks, _subscription: subscription }
     }
 
-    fn set_query(&mut self, query: &str, cx: &mut Context<Self>) {
+    fn set_query(&mut self, query: &str, window: &mut Window, cx: &mut Context<Self>) {
         self.items = rank(query, &self.commands);
-        self.active = 0;
-        self.scroll.scroll_to_item(0);
+        self.active = if query.trim().is_empty() { self.home } else { 0 };
+        self.scroll.scroll_to_item(self.active);
+        self.cursor_moved(window, cx);
         cx.notify();
     }
 
@@ -138,18 +170,37 @@ impl CommandPalette {
         self.items.iter().map(|(ix, _)| self.commands[*ix].label.clone()).collect()
     }
 
+    #[cfg(test)]
+    pub fn placeholder(&self, cx: &App) -> SharedString {
+        self.input.read(cx).presentation().placeholder().clone()
+    }
+
+    #[cfg(test)]
+    pub fn active_label(&self) -> String {
+        self.items.get(self.active_ix()).map(|(ix, _)| self.commands[*ix].label.clone()).unwrap_or_default()
+    }
+
     fn active_ix(&self) -> usize {
         self.active.min(self.items.len().saturating_sub(1))
     }
 
-    fn step(&mut self, down: bool, cx: &mut Context<Self>) {
+    fn step(&mut self, down: bool, window: &mut Window, cx: &mut Context<Self>) {
         if self.items.is_empty() {
             return;
         }
         let current = self.active_ix();
         self.active = if down { (current + 1).min(self.items.len() - 1) } else { current.saturating_sub(1) };
         self.scroll.scroll_to_item(self.active);
+        self.cursor_moved(window, cx);
         cx.notify();
+    }
+
+    // Keys and typing move the cursor; hovering only highlights, so the mouse doesn't flash previews.
+    fn cursor_moved(&self, window: &mut Window, cx: &mut Context<Self>) {
+        let (Some(on_cursor), Some((ix, _))) = (&self.hooks.on_cursor, self.items.get(self.active_ix())) else {
+            return;
+        };
+        on_cursor(&self.commands[*ix], window, cx);
     }
 
     // Closing gives focus back to where the palette was opened from, which then takes the action.
@@ -188,7 +239,7 @@ impl CommandPalette {
                 this.confirm(window, cx);
             }))
             .child(div().flex_1().min_w_0().truncate().text_size(TEXT_BASE).child(label))
-            .when_some(command.shortcut.clone(), |el, shortcut| {
+            .when_some(command.shortcut.clone().or_else(|| command.tag.clone()), |el, shortcut| {
                 el.child(
                     div()
                         .flex_none()
@@ -229,13 +280,13 @@ impl Render for CommandPalette {
         };
         v_flex()
             .key_context("CommandPalette")
-            .capture_action(cx.listener(|this, _: &MoveUp, _, cx| {
+            .capture_action(cx.listener(|this, _: &MoveUp, window, cx| {
                 cx.stop_propagation();
-                this.step(false, cx);
+                this.step(false, window, cx);
             }))
-            .capture_action(cx.listener(|this, _: &MoveDown, _, cx| {
+            .capture_action(cx.listener(|this, _: &MoveDown, window, cx| {
                 cx.stop_propagation();
-                this.step(true, cx);
+                this.step(true, window, cx);
             }))
             .on_action(cx.listener(|this, _: &Enter, window, cx| this.confirm(window, cx)))
             .child(
@@ -250,10 +301,25 @@ impl Render for CommandPalette {
 }
 
 pub fn open(commands: Vec<Command>, window: &mut Window, cx: &mut App) -> Entity<CommandPalette> {
-    let view = cx.new(|cx| CommandPalette::new(commands, window, cx));
+    let placeholder = t(cx, "commandPalette.placeholder");
+    open_with(commands, 0, placeholder, Hooks::default(), window, cx)
+}
+
+// Esc and a click outside close through `on_close`; a pick closes the dialog directly, which skips it.
+pub fn open_with(
+    commands: Vec<Command>,
+    active: usize,
+    placeholder: SharedString,
+    hooks: Hooks,
+    window: &mut Window,
+    cx: &mut App,
+) -> Entity<CommandPalette> {
+    let on_dismiss = hooks.on_dismiss.clone();
+    let view = cx.new(|cx| CommandPalette::new(commands, active, placeholder, hooks, window, cx));
     let dialog = view.clone();
     window.open_dialog(cx, move |modal, window, cx| {
         let rem = window.rem_size();
+        let on_dismiss = on_dismiss.clone();
         modal
             .w(rem * 46.154)
             .margin_top(rem * 5.5)
@@ -262,6 +328,11 @@ pub fn open(commands: Vec<Command>, window: &mut Window, cx: &mut App) -> Entity
             .rounded(RADIUS_LG)
             .close_button(false)
             .on_ok(|_, _, _| false)
+            .on_close(move |_, window, cx| {
+                if let Some(on_dismiss) = &on_dismiss {
+                    on_dismiss(window, cx);
+                }
+            })
             .child(dialog.clone())
     });
     let input = view.read(cx).input.clone();
@@ -275,7 +346,16 @@ mod tests {
     use crate::actions::NewTab;
 
     fn command(label: &str) -> Command {
-        Command { label: label.into(), action: Box::new(NewTab), shortcut: None }
+        Command { label: label.into(), action: Box::new(NewTab), shortcut: None, tag: None }
+    }
+
+    #[test]
+    fn a_tag_finds_rows_whose_label_doesnt_say_it() {
+        let tagged = |label: &str, tag: &str| Command { tag: Some(tag.into()), ..command(label) };
+        let commands = [tagged("Nord", "Dark"), tagged("One Light", "Light"), tagged("One Dark", "Dark")];
+        let order = |query: &str| rank(query, &commands).into_iter().map(|(ix, _)| ix).collect::<Vec<_>>();
+        assert_eq!(order("dark"), [2, 0], "a label that says it comes first");
+        assert_eq!(order("light"), [1]);
     }
 
     #[test]
